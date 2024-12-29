@@ -22,7 +22,8 @@ main = do args <- getArgs
 
 runFile filename = do
   file <- readFile filename 
-  evalAndPrint . stripRTLOverride $ file
+  env <- primitiveBindings 
+  evalAndPrint env . stripRTLOverride $ file
   
 
 stripRTLOverride ('\x202e':xs) = xs
@@ -37,7 +38,9 @@ data LispVal = Atom String
              | DottedList [LispVal] LispVal
              | String String
              | Bool Bool
-  deriving (Eq)
+             | PrimitiveFunc ([LispVal] -> Either LispError LispVal)
+             | Func { params :: [String], vararg :: (Maybe String),
+                      body :: [LispVal], closure :: Env }
 
 disp (Atom a) = a
 disp (List [Atom "גרש", x]) = '׳' : show x 
@@ -46,9 +49,23 @@ disp (DottedList vals last) = "(" ++ L.intercalate " " (show <$> vals) ++ " . " 
 disp (String s) = '"' : s ++ ['"']
 disp (Bool True) = "#כן" 
 disp (Bool False) = "#לֹא" 
+disp (PrimitiveFunc f) = "<פרימיטיבית>" 
+disp (Func {params = args, vararg = varargs, body = body, closure = env}) =
+   "(למד (" ++ unwords (map show args) ++
+      (case varargs of
+         Nothing -> ""
+         Just arg -> " . " ++ arg) ++ ") ...)"
 
 instance (Show LispVal) where
   show = disp
+
+instance (Eq LispVal) where
+ Atom a == Atom b = a == b
+ List xs == List ys = xs == ys
+ DottedList xs x == DottedList ys y = xs == ys && x == y
+ String s == String s2 = s == s2
+ Bool b == Bool b2 = b == b2
+ _ == _ = False
 
 ----------------------
 -- Parsing
@@ -150,23 +167,108 @@ trapError action = catchError action (return . show)
 extractValue :: Either b a -> a
 extractValue (Right val) = val
 
+liftThrows :: Either LispError a -> ExceptT LispError IO a
+liftThrows = either throwError pure
+
+runIOThrows :: ExceptT LispError IO String -> IO String
+runIOThrows action = runExceptT (trapError action) >>= return . extractValue
+
+
+------------------------------------------------------
+-- env
+------------------------------------------------------
+
+type Env = IORef (M.Map String (IORef LispVal))
+
+newEnv = newIORef M.empty 
+
+primitiveBindings :: IO Env
+primitiveBindings = newEnv >>= (flip bindVars $ map makePrimitiveFunc primitives)
+     where makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
+
+isBound :: Env -> String -> IO Bool
+isBound envRef var = readIORef envRef >>= return . maybe False (const True) . M.lookup var
+
+getVar :: Env -> String -> ExceptT LispError IO LispVal
+getVar envRef var  =  do env <- liftIO $ readIORef envRef
+                         maybe (throwError $ UnboundVar "Getting an unbound variable" var)
+                               (liftIO . readIORef)
+                               (M.lookup var env)
+
+setVar :: Env -> String -> LispVal -> ExceptT LispError IO LispVal
+setVar envRef var value = do env <- liftIO $ readIORef envRef
+                             maybe (throwError $ UnboundVar "Setting an unbound variable" var)
+                                   (liftIO . (flip writeIORef value))
+                                   (M.lookup var env)
+                             return value
+
+defineVar :: Env -> String -> LispVal -> ExceptT LispError IO LispVal
+defineVar envRef var value = do
+     alreadyDefined <- liftIO $ isBound envRef var
+     if alreadyDefined
+        then setVar envRef var value >> return value
+        else liftIO $ do
+             valueRef <- newIORef value
+             env <- readIORef envRef
+             writeIORef envRef (M.insert var valueRef env)
+             return value
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars envRef bindings =
+  do env <- readIORef envRef
+     newBindings <- traverse addBinding bindings
+     newIORef $ M.union env (M.fromList newBindings)
+  where addBinding (var, value) = do ref <- newIORef value
+                                     return (var, ref)
+
+
 
 ------------------------------------------------------
 -- eval
 ------------------------------------------------------
 
-eval :: LispVal -> Either LispError LispVal
-eval val@(String _) = return val
-eval val@(Bool _) = return val
-eval (List [Atom "אם", pred, t, f]) = eval pred >>= \x -> if x == Bool False then eval f else eval t
-eval (List [Atom "גרשּּ", val]) = return val
-eval (List (Atom func : args)) = mapM eval args >>= apply func
-eval badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+eval :: Env -> LispVal -> ExceptT LispError IO LispVal
+eval env val@(String _) = return val
+eval env val@(Bool _) = return val
+eval env (Atom id) = getVar env id
+eval env (List [Atom "אם", pred, t, f]) = eval env pred >>= \x -> if x == Bool False then eval env f else eval env t
+eval env (List [Atom "גרשּּ", val]) = return val
+eval env (List [Atom "שים!", Atom var, form]) =
+     eval env form >>= setVar env var
+eval env (List [Atom "תחם", Atom var, form]) =
+     eval env form >>= defineVar env var
+eval env (List (Atom "תחם" : List (Atom var : params) : body)) =
+     makeNormalFunc env params body >>= defineVar env var
+eval env (List (Atom "תחם" : DottedList (Atom var : params) varargs : body)) =
+     makeVarArgs varargs env params body >>= defineVar env var
+eval env (List (Atom "למד" : List params : body)) =
+     makeNormalFunc env params body
+eval env (List (Atom "למד" : DottedList params varargs : body)) =
+     makeVarArgs varargs env params body
+eval env (List (Atom "למד" : varargs@(Atom _) : body)) =
+     makeVarArgs varargs env [] body
+eval env (List (function : args)) = do
+     func <- eval env function
+     argVals <- mapM (eval env) args
+     apply func argVals
+eval env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
-apply :: String -> [LispVal] -> Either LispError LispVal
-apply func args = maybe (throwError $ NotFunction "Unrecognized primitive function args" func)
-                        ($ args)
-                        (lookup func primitives)
+apply :: LispVal -> [LispVal] -> ExceptT LispError IO LispVal
+apply (PrimitiveFunc func) args = liftThrows $ func args
+apply (Func params varargs body closure) args =
+      if num params /= num args && varargs == Nothing
+         then throwError $ NumArgs (num params) args
+         else (liftIO $ bindVars closure $ zip params args) >>= bindVarArgs varargs >>= evalBody
+      where remainingArgs = drop (length params) args
+            num = toInteger . length
+            evalBody env = liftM last $ mapM (eval env) body
+            bindVarArgs arg env = case arg of
+                Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
+                Nothing -> return env
+
+makeFunc varargs env params body = return $ Func (map disp params) varargs body env
+makeNormalFunc = makeFunc Nothing
+makeVarArgs = makeFunc . Just . disp
 
 primitives :: [(String, [LispVal] -> Either LispError LispVal)]
 primitives = [
@@ -331,11 +433,11 @@ flushStr str = putStr str >> hFlush stdout
 readPrompt :: String -> IO String
 readPrompt prompt = flushStr prompt >> getLine
 
-evalString :: String -> IO String
-evalString expr = return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
+evalString :: Env -> String -> IO String
+evalString env expr = runIOThrows $ liftM show $ (liftThrows $ readExpr expr) >>= eval env
 
-evalAndPrint :: String -> IO ()
-evalAndPrint expr =  evalString expr >>= putStrLn
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env expr =  evalString env expr >>= putStrLn
 
 until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
 until_ pred prompt action = do 
@@ -346,7 +448,7 @@ until_ pred prompt action = do
 
 
 runRepl :: IO ()
-runRepl = until_ (== "לצאת") (readPrompt "מזמה>>> ") evalAndPrint
+runRepl = primitiveBindings >>= until_ (== "לצאת") (readPrompt "מזמה>>> ") . evalAndPrint
 
 
 -- examples 
